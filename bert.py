@@ -8,8 +8,10 @@ from transformers import BertTokenizer, BertModel
 class BertClassifier(nn.Module):
     def __init__(self):
         super(BertClassifier, self).__init__()
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
-
+        self.bert = BertModel.from_pretrained(
+            "bert-base-uncased",
+            attn_implementation="eager",
+        )
     def forward(self, input_ids, attention_mask, token_type_ids=None):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask,
                             token_type_ids=token_type_ids, output_attentions=True)
@@ -24,6 +26,7 @@ tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 # Input sentence
 sentence = "This is an example sentence."
+sentence = sentence * 15  # Repeat the sentence to increase length
 inputs = tokenizer(sentence, return_tensors="pt")
 
 # Get model outputs
