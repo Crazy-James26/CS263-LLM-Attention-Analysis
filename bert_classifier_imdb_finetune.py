@@ -40,7 +40,7 @@ class IMDBDataset(Dataset):
         }
 
 class EarlyStopping:
-    def __init__(self, patience=3, min_delta=0, path='best_model.pt'):
+    def __init__(self, patience=3, min_delta=0, path=None):
         self.patience = patience
         self.min_delta = min_delta
         self.path = path
@@ -63,11 +63,12 @@ class EarlyStopping:
             
     def save_checkpoint(self, model):
         torch.save(model.state_dict(), self.path)
+        print(f'Model saved to {self.path}')
 
 def train_model(model, train_loader, val_loader, test_loader, device, epochs=10):
     optimizer = AdamW(model.parameters(), lr=2e-5)
     criterion = nn.CrossEntropyLoss()
-    early_stopping = EarlyStopping(patience=3, path='best_bert_model.pt')
+    early_stopping = EarlyStopping(patience=3, path='ckpts/best_bert_imdb_model.pt')
     
     history = {
         'train_loss': [], 'train_acc': [],
@@ -82,7 +83,8 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=10)
         train_correct = 0
         train_total = 0
         
-        for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs}'):
+        # for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{epochs}'):
+        for batch in train_loader: 
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
@@ -147,7 +149,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=10)
             break
     
     # Load best model
-    model.load_state_dict(torch.load('best_bert_model.pt'))
+    model.load_state_dict(torch.load('ckpts/best_bert_imdb_model.pt'))
     return history
 
 def evaluate_model(model, data_loader, criterion, device):
@@ -197,7 +199,7 @@ def plot_training_history(history):
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('training_history.png')
+    plt.savefig('ckpts/training_history.png')
     plt.close()
 
 def main():
@@ -205,7 +207,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load IMDB dataset
-    df = pd.read_csv('IMDB Dataset.csv')
+    df = pd.read_csv('dataset/IMDB Dataset.csv')
     reviews = df['review'].values
     labels = (df['sentiment'] == 'positive').astype(int).values
     
@@ -248,8 +250,8 @@ def main():
     print(f'Accuracy: {test_accuracy:.2f}%')
     
     # Save the model and tokenizer
-    model.save_pretrained('bert_imdb_model')
-    tokenizer.save_pretrained('bert_imdb_tokenizer')
+    # model.save_pretrained('bert_imdb_model')
+    # tokenizer.save_pretrained('bert_imdb_tokenizer')
 
 if __name__ == "__main__":
     main()
