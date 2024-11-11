@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformers import BertTokenizer, BertForSequenceClassification, AdamW
+from transformers import BigBirdTokenizer, BigBirdForSequenceClassification
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 import pandas as pd
@@ -8,9 +8,10 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 from copy import deepcopy
+from transformers import AdamW
 
 class IMDBDataset(Dataset):
-    def __init__(self, reviews, targets, tokenizer, max_length=512):
+    def __init__(self, reviews, targets, tokenizer, max_length=1024):  # Updated max_length for BigBird
         self.reviews = reviews
         self.targets = targets
         self.tokenizer = tokenizer
@@ -68,7 +69,7 @@ class EarlyStopping:
 def train_model(model, train_loader, val_loader, test_loader, device, epochs=10):
     optimizer = AdamW(model.parameters(), lr=2e-5)
     criterion = nn.CrossEntropyLoss()
-    early_stopping = EarlyStopping(patience=3, path='ckpts/best_bert_imdb_model.pt')
+    early_stopping = EarlyStopping(patience=3, path='ckpts/best_bigbird_imdb_model.pt')
     
     history = {
         'train_loss': [], 'train_acc': [],
@@ -149,7 +150,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=10)
             break
     
     # Load best model
-    model.load_state_dict(torch.load('ckpts/best_bert_imdb_model.pt'))
+    model.load_state_dict(torch.load('ckpts/best_bigbird_imdb_model.pt'))
     return history
 
 def evaluate_model(model, data_loader, criterion, device):
@@ -199,7 +200,7 @@ def plot_training_history(history):
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('ckpts/training_history_bert_imdb.png')
+    plt.savefig('ckpts/training_history_bigbird_imdb.png')
     plt.close()
 
 def main():
@@ -219,10 +220,10 @@ def main():
         temp_texts, temp_labels, test_size=0.5, random_state=42
     )
     
-    # Initialize tokenizer and model
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertForSequenceClassification.from_pretrained(
-        'bert-base-uncased',
+    # Replace BERT tokenizer and model with BigBird
+    tokenizer = BigBirdTokenizer.from_pretrained('google/bigbird-roberta-base')
+    model = BigBirdForSequenceClassification.from_pretrained(
+        'google/bigbird-roberta-base',
         num_labels=2
     ).to(device)
     
@@ -230,11 +231,14 @@ def main():
     train_dataset = IMDBDataset(train_texts, train_labels, tokenizer)
     val_dataset = IMDBDataset(val_texts, val_labels, tokenizer)
     test_dataset = IMDBDataset(test_texts, test_labels, tokenizer)
+
+    # Update batch size due to BigBird's memory requirements
+    batch_size = 8  # Reduced from 16 due to larger model size
     
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=16)
-    test_loader = DataLoader(test_dataset, batch_size=16)
+    # Create dataloaders with updated batch size
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
     # Train the model
     history = train_model(model, train_loader, val_loader, test_loader, device)
