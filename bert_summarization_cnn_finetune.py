@@ -5,7 +5,6 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from transformers import AdamW
 import nltk
 from nltk.tokenize import sent_tokenize
 nltk.download('punkt')
@@ -35,6 +34,27 @@ class SummarizationDataset(Dataset):
             is_important = any(self._sentence_overlap(sent, h_sent) > 0.5 
                              for h_sent in highlight_sentences)
             sentence_labels.append(1 if is_important else 0)
+
+        # # Create sentence-level labels
+        # sentence_labels = [0] * len(article_sentences)
+        # # print("\nlabed highlights:\n")
+        # for h_sent in highlight_sentences:
+        #     # Find the most related sentence in article_sentences
+        #     max_overlap = 0
+        #     best_sentence_idx = -1
+            
+        #     for i, sent in enumerate(article_sentences):
+        #         overlap = self._sentence_overlap(sent, h_sent)
+        #         if overlap > max_overlap:
+        #             max_overlap = overlap
+        #             best_sentence_idx = i
+            
+        #     # Mark the most related sentence as important
+        #     if best_sentence_idx >= 0:
+        #         sentence_labels[best_sentence_idx] = 1
+        #         # print(h_sent)
+        #         # print(article_sentences[best_sentence_idx], "\n")
+        # # print(sentence_labels)
 
         # Tokenize article
         encoding = self.tokenizer.encode_plus(
@@ -98,9 +118,10 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         print(f'Model saved to {self.path}')
 
-def train_model(model, train_loader, val_loader, test_loader, device, epochs=10):
-    optimizer = AdamW(model.parameters(), lr=2e-5)
-    criterion = nn.BCEWithLogitsLoss()
+def train_model(model, train_loader, val_loader, test_loader, device, epochs=3):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6)
+    pos_weight = 10  # Assign a higher weight for the minority class, tweak this value as needed
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
     early_stopping = EarlyStopping(patience=3, path='ckpts/best_bert_summarization_model.pt')
     
     history = {
@@ -124,6 +145,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=10)
             optimizer.zero_grad()
             outputs = model(input_ids, attention_mask=attention_mask)
             loss = criterion(outputs.logits.squeeze(-1), labels.float())
+            loss = (loss * attention_mask).sum() / attention_mask.sum()
             loss.backward()
             optimizer.step()
             
@@ -150,6 +172,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=10)
                 
                 outputs = model(input_ids, attention_mask=attention_mask)
                 loss = criterion(outputs.logits.squeeze(-1), labels.float())
+                loss = (loss * attention_mask).sum() / attention_mask.sum()
                 
                 val_loss += loss.item()
                 predictions = (torch.sigmoid(outputs.logits.squeeze(-1)) > 0.5).float()
@@ -181,7 +204,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=10)
             print("Early stopping triggered")
             break
     
-    model.load_state_dict(torch.load('ckpts/best_bert_summarization_model.pt'))
+    model.load_state_dict(torch.load('ckpts/best_bert_summarization_model.pt', weights_only=True))
     return history
 
 def evaluate_model(model, data_loader, criterion, device):
@@ -198,6 +221,7 @@ def evaluate_model(model, data_loader, criterion, device):
             
             outputs = model(input_ids, attention_mask=attention_mask)
             loss = criterion(outputs.logits.squeeze(-1), labels.float())
+            loss = (loss * attention_mask).sum() / attention_mask.sum()
             
             total_loss += loss.item()
             predictions = (torch.sigmoid(outputs.logits.squeeze(-1)) > 0.5).float()
@@ -276,7 +300,8 @@ def main():
     plot_training_history(history)
     
     # Final evaluation
-    criterion = nn.BCEWithLogitsLoss()
+    pos_weight = 10  # Assign a higher weight for the minority class, tweak this value as needed
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
     test_loss, test_accuracy = evaluate_model(model, test_loader, criterion, device)
     print(f'\nFinal Test Set Performance:')
     print(f'Loss: {test_loss:.4f}')
