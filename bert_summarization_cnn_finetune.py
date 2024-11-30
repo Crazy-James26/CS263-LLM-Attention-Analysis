@@ -123,10 +123,22 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         print(f'Model saved to {self.path}')
 
-def train_model(model, train_loader, val_loader, test_loader, device, epochs=3):
+def compute_class_weights(dataset):
+    positive_count = 0
+    negative_count = 0
+
+    for idx in tqdm(range(len(dataset)), desc='Computing class weights'):
+        sample = dataset[idx]
+        labels = sample['labels']
+        attention_mask = sample['attention_mask']
+        mask = attention_mask.bool()
+        positive_count += labels[mask].sum().item()
+        negative_count += mask.sum().item() - labels[mask].sum().item()
+
+    return positive_count, negative_count
+
+def train_model(model, train_loader, val_loader, test_loader, device, criterion, epochs=3):
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6)
-    pos_weight = 10  # Assign a higher weight for the minority class
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
     early_stopping = EarlyStopping(patience=3, path='ckpts/best_bert_summarization_model.pt')
     
     history = {
@@ -311,6 +323,9 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Create checkpoints directory if it doesn't exist
+    os.makedirs('ckpts', exist_ok=True)
+    
     # Load CNN/DailyMail dataset
     dataset = load_dataset("cnn_dailymail", "3.0.0")
     
@@ -338,15 +353,23 @@ def main():
         tokenizer
     )
 
+    # **Compute class weights based on the training data**
+    positive_count, negative_count = compute_class_weights(train_dataset)
+    print(f'Positive samples: {positive_count}, Negative samples: {negative_count}')
+
+    # **Calculate pos_weight for BCEWithLogitsLoss**
+    pos_weight = negative_count / positive_count
+    pos_weight_tensor = torch.tensor(pos_weight).to(device)
+    print(f'Calculated pos_weight: {pos_weight}')
+
     # Create dataloaders
     batch_size = 4  # Small batch size due to long sequences
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
-    # Define the loss function with pos_weight for handling class imbalance
-    pos_weight = 10  # Adjust as needed
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
+    # Define the loss function with the calculated pos_weight
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 
     # **Initial Evaluation Before Training**
     print('\nInitial Evaluation on Test Set Before Fine-tuning:')
@@ -365,7 +388,7 @@ def main():
     print(f'NDCG: {initial_val_ndcg:.4f}')
     
     # Train the model
-    history = train_model(model, train_loader, val_loader, test_loader, device)
+    history = train_model(model, train_loader, val_loader, test_loader, device, criterion, epochs=10)
     
     # Plot training history
     plot_training_history(history)
