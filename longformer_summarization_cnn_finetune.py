@@ -7,6 +7,11 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import nltk
 from nltk.tokenize import sent_tokenize
+from sklearn.metrics import roc_auc_score, ndcg_score
+import os
+import random
+import numpy as np
+import torch.backends.cudnn as cudnn
 nltk.download('punkt')
 
 class SummarizationDataset(Dataset):
@@ -118,22 +123,34 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         print(f'Model saved to {self.path}')
 
-def train_model(model, train_loader, val_loader, test_loader, device, epochs=3):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-7)
-    pos_weight = 10  # Assign a higher weight for the minority class, tweak this value as needed
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
+def compute_class_weights(dataset):
+    positive_count = 0
+    negative_count = 0
+
+    for idx in tqdm(range(len(dataset)), desc='Computing class weights'):
+        sample = dataset[idx]
+        labels = sample['labels']
+        attention_mask = sample['attention_mask']
+        mask = attention_mask.bool()
+        positive_count += labels[mask].sum().item()
+        negative_count += mask.sum().item() - labels[mask].sum().item()
+
+    return positive_count, negative_count
+
+def train_model(model, train_loader, val_loader, test_loader, device, criterion, epochs=3):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6)
     early_stopping = EarlyStopping(patience=3, path='ckpts/best_longformer_summarization_model.pt')
     
     history = {
         'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': [],
-        'test_loss': [], 'test_acc': []
+        'val_loss': [], 'val_acc': [], 'val_auc': [], 'val_ndcg': [],
+        'test_loss': [], 'test_acc': [], 'test_auc': [], 'test_ndcg': []
     }
     
     for epoch in range(epochs):
-        # Training
+        # Training loop
         model.train()
-        train_loss = 0
+        train_loss = 0.0
         train_correct = 0
         train_total = 0
         
@@ -144,67 +161,59 @@ def train_model(model, train_loader, val_loader, test_loader, device, epochs=3):
             
             optimizer.zero_grad()
             outputs = model(input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs.logits.squeeze(-1), labels.float())
+            logits = outputs.logits.squeeze(-1)
+            loss = criterion(logits, labels.float())
             loss = (loss * attention_mask).sum() / attention_mask.sum()
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
-            predictions = (torch.sigmoid(outputs.logits.squeeze(-1)) > 0.5).float()
+            predictions = (torch.sigmoid(logits) > 0.5).float()
             mask = attention_mask.bool()
             train_correct += ((predictions == labels).float() * mask).sum().item()
             train_total += mask.sum().item()
         
-        avg_train_loss = train_loss/len(train_loader)
-        train_accuracy = 100 * train_correct/train_total
+        avg_train_loss = train_loss / len(train_loader)
+        train_accuracy = 100 * train_correct / train_total
         
         # Validation
-        model.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                
-                outputs = model(input_ids, attention_mask=attention_mask)
-                loss = criterion(outputs.logits.squeeze(-1), labels.float())
-                loss = (loss * attention_mask).sum() / attention_mask.sum()
-                
-                val_loss += loss.item()
-                predictions = (torch.sigmoid(outputs.logits.squeeze(-1)) > 0.5).float()
-                mask = attention_mask.bool()
-                val_correct += ((predictions == labels).float() * mask).sum().item()
-                val_total += mask.sum().item()
-        
-        avg_val_loss = val_loss/len(val_loader)
-        val_accuracy = 100 * val_correct/val_total
+        avg_val_loss, val_accuracy, val_auc, val_ndcg = evaluate_model(model, val_loader, criterion, device)
         
         # Test set evaluation
-        test_loss, test_accuracy = evaluate_model(model, test_loader, criterion, device)
+        test_loss, test_accuracy, test_auc, test_ndcg = evaluate_model(model, test_loader, criterion, device)
         
         # Store metrics
         history['train_loss'].append(avg_train_loss)
         history['train_acc'].append(train_accuracy)
         history['val_loss'].append(avg_val_loss)
         history['val_acc'].append(val_accuracy)
+        history['val_auc'].append(val_auc)
+        history['val_ndcg'].append(val_ndcg)
         history['test_loss'].append(test_loss)
         history['test_acc'].append(test_accuracy)
+        history['test_auc'].append(test_auc)
+        history['test_ndcg'].append(test_ndcg)
         
-        print(f'Epoch {epoch + 1}:')
+        print(f'\nEpoch {epoch + 1}:')
         print(f'Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.2f}%')
         print(f'Validation Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.2f}%')
+        print(f'Validation AUC: {val_auc:.4f}, NDCG: {val_ndcg:.4f}')
         print(f'Test Loss: {test_loss:.4f}, Accuracy: {test_accuracy:.2f}%')
+        print(f'Test AUC: {test_auc:.4f}, NDCG: {test_ndcg:.4f}')
         
+        # Save the model checkpoint at the end of the epoch
+        checkpoint_path = f'ckpts/longformer_summarization_epoch_{epoch + 1}.pt'
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f'Model checkpoint saved to {checkpoint_path}')
+        
+        # Early stopping
         early_stopping(avg_val_loss, model)
         if early_stopping.early_stop:
             print("Early stopping triggered")
             break
     
-    model.load_state_dict(torch.load('ckpts/best_longformer_summarization_model.pt', weights_only=True))
+    # Load the best model saved by early stopping
+    model.load_state_dict(torch.load('ckpts/best_longformer_summarization_model.pt'))
     return history
 
 def evaluate_model(model, data_loader, criterion, device):
@@ -212,45 +221,88 @@ def evaluate_model(model, data_loader, criterion, device):
     total_loss = 0
     correct = 0
     total = 0
-    
+
+    all_labels = []
+    all_predictions = []
+
     with torch.no_grad():
         for batch in data_loader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-            
+
             outputs = model(input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs.logits.squeeze(-1), labels.float())
+            logits = outputs.logits.squeeze(-1)
+            loss = criterion(logits, labels.float())
             loss = (loss * attention_mask).sum() / attention_mask.sum()
-            
+
             total_loss += loss.item()
-            predictions = (torch.sigmoid(outputs.logits.squeeze(-1)) > 0.5).float()
+            predictions = torch.sigmoid(logits)
+            pred_labels = (predictions > 0.5).float()
             mask = attention_mask.bool()
-            correct += ((predictions == labels).float() * mask).sum().item()
+            correct += ((pred_labels == labels).float() * mask).sum().item()
             total += mask.sum().item()
-    
-    return total_loss/len(data_loader), 100 * correct/total
+
+            # Accumulate for AUC calculation
+            all_labels.extend(labels[mask].cpu().numpy())
+            all_predictions.extend(predictions[mask].cpu().numpy())
+
+    # Compute AUC
+    try:
+        auc_score = roc_auc_score(all_labels, all_predictions)
+    except ValueError:
+        # Handle the case when only one class is present in y_true
+        auc_score = float('nan')
+
+    # Compute NDCG
+    ndcg = ndcg_score([all_labels], [all_predictions])
+
+    avg_loss = total_loss / len(data_loader)
+    accuracy = 100 * correct / total
+
+    return avg_loss, accuracy, auc_score, ndcg
 
 def plot_training_history(history):
     epochs = range(1, len(history['train_loss']) + 1)
     
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(20, 10))
+    
+    # Plot Loss
+    plt.subplot(2, 2, 1)
     plt.plot(epochs, history['train_loss'], 'b-', label='Training Loss')
     plt.plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
     plt.plot(epochs, history['test_loss'], 'g-', label='Test Loss')
-    plt.title('Training, Validation, and Test Loss')
+    plt.title('Loss Over Epochs')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.legend()
     
-    plt.subplot(1, 2, 2)
+    # Plot Accuracy
+    plt.subplot(2, 2, 2)
     plt.plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
     plt.plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
     plt.plot(epochs, history['test_acc'], 'g-', label='Test Accuracy')
-    plt.title('Training, Validation, and Test Accuracy')
+    plt.title('Accuracy Over Epochs')
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy (%)')
+    plt.legend()
+
+    # Plot AUC
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs, history['val_auc'], 'r-', label='Validation AUC')
+    plt.plot(epochs, history['test_auc'], 'g-', label='Test AUC')
+    plt.title('AUC Over Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('AUC')
+    plt.legend()
+
+    # Plot NDCG
+    plt.subplot(2, 2, 4)
+    plt.plot(epochs, history['val_ndcg'], 'r-', label='Validation NDCG')
+    plt.plot(epochs, history['test_ndcg'], 'g-', label='Test NDCG')
+    plt.title('NDCG Over Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('NDCG')
     plt.legend()
     
     plt.tight_layout()
@@ -258,7 +310,21 @@ def plot_training_history(history):
     plt.close()
 
 def main():
+    # **Set Random Seeds for Reproducibility**
+    seed = 42  # You can use any integer as the seed
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # If you are using multi-GPU.
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create checkpoints directory if it doesn't exist
+    os.makedirs('ckpts', exist_ok=True)
     
     # Load CNN/DailyMail dataset
     dataset = load_dataset("cnn_dailymail", "3.0.0")
@@ -287,29 +353,57 @@ def main():
         tokenizer
     )
 
+    # **Compute class weights based on the training data**
+    positive_count, negative_count = compute_class_weights(train_dataset)
+    print(f'Positive samples: {positive_count}, Negative samples: {negative_count}')
+
+    # **Calculate pos_weight for BCEWithLogitsLoss**
+    pos_weight = negative_count / positive_count
+    pos_weight_tensor = torch.tensor(pos_weight).to(device)
+    print(f'Calculated pos_weight: {pos_weight}')
+
     # Create dataloaders
     batch_size = 4  # Small batch size due to long sequences
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
+    # Define the loss function with the calculated pos_weight
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+
+    # **Initial Evaluation Before Training**
+    print('\nInitial Evaluation on Test Set Before Fine-tuning:')
+    initial_test_loss, initial_test_accuracy, initial_test_auc, initial_test_ndcg = evaluate_model(model, test_loader, criterion, device)
+    print(f'Loss: {initial_test_loss:.4f}')
+    print(f'Accuracy: {initial_test_accuracy:.2f}%')
+    print(f'AUC: {initial_test_auc:.4f}')
+    print(f'NDCG: {initial_test_ndcg:.4f}')
+    
+    # **Initial Evaluation on Validation Set (Optional)**
+    print('\nInitial Evaluation on Validation Set Before Fine-tuning:')
+    initial_val_loss, initial_val_accuracy, initial_val_auc, initial_val_ndcg = evaluate_model(model, val_loader, criterion, device)
+    print(f'Loss: {initial_val_loss:.4f}')
+    print(f'Accuracy: {initial_val_accuracy:.2f}%')
+    print(f'AUC: {initial_val_auc:.4f}')
+    print(f'NDCG: {initial_val_ndcg:.4f}')
+    
     # Train the model
-    history = train_model(model, train_loader, val_loader, test_loader, device)
+    history = train_model(model, train_loader, val_loader, test_loader, device, criterion, epochs=10)
     
     # Plot training history
     plot_training_history(history)
     
-    # Final evaluation
-    pos_weight = 13  # Assign a higher weight for the minority class, tweak this value as needed
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).to(device))
-    test_loss, test_accuracy = evaluate_model(model, test_loader, criterion, device)
-    print(f'\nFinal Test Set Performance:')
+    # Final evaluation after training
+    test_loss, test_accuracy, test_auc, test_ndcg = evaluate_model(model, test_loader, criterion, device)
+    print('\nFinal Test Set Performance After Fine-tuning:')
     print(f'Loss: {test_loss:.4f}')
     print(f'Accuracy: {test_accuracy:.2f}%')
+    print(f'AUC: {test_auc:.4f}')
+    print(f'NDCG: {test_ndcg:.4f}')
     
     # Save the model and tokenizer
-    # model.save_pretrained('bigbird_summarization_model')
-    # tokenizer.save_pretrained('bigbird_summarization_tokenizer')
+    model.save_pretrained('longformer_summarization_model')
+    tokenizer.save_pretrained('longformer_summarization_tokenizer')
 
 if __name__ == "__main__":
     main()
